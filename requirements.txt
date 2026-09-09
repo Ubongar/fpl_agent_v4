@@ -1,0 +1,12 @@
+sqlalchemy>=2.0
+psycopg2-binary
+pandas
+numpy
+scipy
+scikit-learn
+requests
+streamlit
+plotly
+pulp
+openai
+python-dotenv
