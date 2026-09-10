@@ -1,168 +1,274 @@
-"""Populates the `predictions` table with real per-player xP for a given
-gameweek. This is the piece that was missing entirely: predictions existed in
-schema.sql but nothing wrote to it, so every optimizer downstream had no real
-data to consume.
+"""Populates the `predictions` table with per-player xP for a given gameweek.
 
-Pipeline per player: real fixture(s) for gw -> real team_strength ratings ->
-dixon_coles -> expected_points -> distributions, with DGW legs summed via
-dgw_bgw.adjust_for_dgw and BGW players skipped entirely (no fixture = no
-prediction row, not a fabricated 0).
+v5 BATCHED: The original version made roughly 3 DB round-trips per player
+(~2100 queries for ~700 players). Against a local Postgres that was fine
+(~30s); against Neon's cloud endpoint (~100ms RTT) it took 5-10 minutes and
+looked hung with no progress output.
 
-Usage:
-    python -m models.run_predictions --gw N
+This version does 8 queries total:
+  1. all players
+  2. all statuses
+  3. all team ratings
+  4. all fixtures in the GW
+  5. all minutes histories (one query, grouped in Python)
+  6. all player xG/xA sums (one query, grouped in Python)
+  7. all team xG totals (one query, grouped in Python)
+  8. one batched executemany INSERT for every prediction row
+
+Plus a tqdm progress bar over the Python-side computation so it's visibly
+alive on long runs.
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+from tqdm import tqdm
 from db.connection import get_session
 from sqlalchemy import text
 from models.expected_points import player_expected_points
 from models.distributions import sample_points_distribution
 from optimizers.dgw_bgw import adjust_for_dgw
-from models.train_team_strength import get_latest_ratings
+from config import GOAL_SHARE_WINDOW, MINUTES_HISTORY_WINDOW
 
-MODEL_VERSION = "v4"
-GOAL_SHARE_WINDOW = 6  # gameweeks of real goals/assists used to estimate a player's share of team goals
+MODEL_VERSION = "v5"
+
+NEUTRAL_RATING = {"attack_home": 1.0, "attack_away": 1.0,
+                  "defence_home": 1.0, "defence_away": 1.0}
+
+# Bayesian shrinkage priors (same as before, hoisted to module level)
+PRIOR_GOAL_SHARE = {"FWD": 0.35, "MID": 0.20, "DEF": 0.05, "GK": 0.0}
+PRIOR_ASSIST_SHARE = {"FWD": 0.15, "MID": 0.25, "DEF": 0.10, "GK": 0.0}
+ALPHA = 4.0
 
 
-def _minutes_history(session, player_id, up_to_gw, window=10):
+# --------------------------------------------------------------------------- #
+# Batch loaders — one query each
+# --------------------------------------------------------------------------- #
+def _load_players(session):
     rows = session.execute(text(
-        "SELECT minutes FROM player_gw_points WHERE player_id=:p AND gw <= :gw "
-        "ORDER BY gw DESC LIMIT :w"), dict(p=player_id, gw=up_to_gw, w=window)).fetchall()
-    return [r.minutes for r in rows][::-1]
+        "SELECT player_id, team_id, position FROM players"
+    )).fetchall()
+    return [{"pid": r.player_id, "team_id": r.team_id, "pos": r.position}
+            for r in rows]
 
 
-# Create an empty dictionary above the function to store the cached team data
-_team_xg_cache = {}
+def _load_statuses(session, up_to_gw):
+    """Status as of the latest snapshot BEFORE up_to_gw. Players with no
+    prior snapshot default to 'a' (available) — we don't know otherwise."""
+    rows = session.execute(text("""
+        SELECT DISTINCT ON (player_id) player_id, status
+        FROM player_snapshots
+        WHERE gw < :gw
+        ORDER BY player_id, pulled_at DESC
+    """), dict(gw=up_to_gw)).fetchall()
+    return {r.player_id: r.status for r in rows}
 
-def _team_expected_goals(session, team_id, up_to_gw, window=GOAL_SHARE_WINDOW):
-    """Calculates the team's total expected goals (xG) over the rolling window 
-    by summing the xG of all players on that team, utilizing an in-memory cache."""
-    
-    # 1. Define a unique signature for this specific query
-    cache_key = (team_id, up_to_gw, window)
-    
-    # 2. Check the cache before hitting PostgreSQL
-    if cache_key in _team_xg_cache:
-        return _team_xg_cache[cache_key]
-        
-    # 3. If not in cache, run the expensive query
-    row = session.execute(text("""
-        SELECT COALESCE(SUM(pgw.expected_goals), 0) AS team_xg
+
+def _load_ratings(session, up_to_gw):
+    rows = session.execute(text("""
+        SELECT DISTINCT ON (team_id) team_id, attack_home, attack_away,
+               defence_home, defence_away
+        FROM team_strength WHERE gw <= :gw
+        ORDER BY team_id, gw DESC
+    """), dict(gw=up_to_gw)).fetchall()
+    return {
+        r.team_id: {
+            "attack_home": float(r.attack_home),
+            "attack_away": float(r.attack_away),
+            "defence_home": float(r.defence_home),
+            "defence_away": float(r.defence_away),
+        } for r in rows
+    }
+
+
+def _load_fixtures(session, gw):
+    rows = session.execute(text(
+        "SELECT fixture_id, home_team_id, away_team_id FROM fixtures WHERE gw = :gw"
+    ), dict(gw=gw)).fetchall()
+    by_team = {}
+    for r in rows:
+        by_team.setdefault(r.home_team_id, []).append((r, True))
+        by_team.setdefault(r.away_team_id, []).append((r, False))
+    return by_team
+
+
+def _load_minutes_histories(session, up_to_gw, window):
+    """One query: minutes history for EVERY player. Returns
+    {player_id: [minutes ascending, truncated to last `window`]}."""
+    rows = session.execute(text("""
+        SELECT player_id, gw, minutes
+        FROM player_gw_points
+        WHERE gw <= :gw AND minutes IS NOT NULL
+        ORDER BY player_id, gw
+    """), dict(gw=up_to_gw)).fetchall()
+    by_player = {}
+    for r in rows:
+        by_player.setdefault(r.player_id, []).append(r.minutes)
+    return {pid: mins[-window:] for pid, mins in by_player.items()}
+
+
+def _load_player_xgxa(session, up_to_gw, window):
+    """One query: sum(xG), sum(xA) per player over the last `window` GWs."""
+    rows = session.execute(text("""
+        SELECT player_id,
+               COALESCE(SUM(expected_goals), 0) AS xg,
+               COALESCE(SUM(expected_assists), 0) AS xa
+        FROM (
+            SELECT player_id, expected_goals, expected_assists,
+                   ROW_NUMBER() OVER (PARTITION BY player_id
+                                      ORDER BY gw DESC) AS rn
+            FROM player_gw_points
+            WHERE gw <= :gw
+        ) sub
+        WHERE rn <= :w
+        GROUP BY player_id
+    """), dict(gw=up_to_gw, w=window)).fetchall()
+    return {r.player_id: (float(r.xg), float(r.xa)) for r in rows}
+
+
+def _load_team_xg(session, up_to_gw, window):
+    """One query: sum(xG) per team over the last `window` GWs."""
+    rows = session.execute(text("""
+        SELECT p.team_id,
+               COALESCE(SUM(pgw.expected_goals), 0) AS team_xg
         FROM player_gw_points pgw
         JOIN players p ON p.player_id = pgw.player_id
-        WHERE p.team_id = :t 
-          AND pgw.gw <= :gw 
-          AND pgw.gw > :gw - :w
-    """), dict(t=team_id, gw=up_to_gw, w=window)).fetchone()
-    
-    # 4. Save the result to the cache for the next player on this team
-    _team_xg_cache[cache_key] = float(row.team_xg)
-    
-    return _team_xg_cache[cache_key]
+        WHERE pgw.gw <= :gw AND pgw.gw > :gw - :w
+        GROUP BY p.team_id
+    """), dict(gw=up_to_gw, w=window)).fetchall()
+    return {r.team_id: float(r.team_xg) for r in rows}
 
 
-def _player_xg_xa_share(session, player_id, team_id, position, up_to_gw, window=GOAL_SHARE_WINDOW):
-    """Calculates the player's share of team xG and xA, regularized with a 
-    Bayesian prior based on their position to handle early-season small sample sizes."""
-    
-    # 1. Fetch the player's accumulated xG and xA
-    row = session.execute(text("""
-        SELECT COALESCE(SUM(expected_goals),0) AS xg, COALESCE(SUM(expected_assists),0) AS xa 
-        FROM (
-            SELECT expected_goals, expected_assists 
-            FROM player_gw_points 
-            WHERE player_id=:p AND gw <= :gw 
-            ORDER BY gw DESC 
-            LIMIT :w
-        ) AS recent_gws
-    """), dict(p=player_id, gw=up_to_gw, w=window)).fetchone()
-    
-    player_xg = float(row.xg)
-    player_xa = float(row.xa)
-    
-    # 2. Fetch the team's accumulated xG
-    team_xg = _team_expected_goals(session, team_id, up_to_gw, window)
-    
-    # 3. Define the Positional Priors
-    PRIOR_GOAL_SHARE = {"FWD": 0.35, "MID": 0.20, "DEF": 0.05, "GK": 0.0}
-    PRIOR_ASSIST_SHARE = {"FWD": 0.15, "MID": 0.25, "DEF": 0.10, "GK": 0.0}
-    ALPHA = 4.0  # The shrinkage weight (acts as ~3 matches of underlying team xG)
-    
-    prior_g = PRIOR_GOAL_SHARE.get(position, 0.0)
-    prior_a = PRIOR_ASSIST_SHARE.get(position, 0.0)
-    
-    # 4. Apply Bayesian Shrinkage Formula
-    adjusted_goal_share = (player_xg + (ALPHA * prior_g)) / (team_xg + ALPHA)
-    adjusted_assist_share = (player_xa + (ALPHA * prior_a)) / (team_xg + ALPHA)
-    
-    return adjusted_goal_share, adjusted_assist_share
+# --------------------------------------------------------------------------- #
+# Pure Python helper
+# --------------------------------------------------------------------------- #
+def _share_from_aggregates(player_xg, player_xa, team_xg, position):
+    """Bayesian-shrunk goal/assist shares. Same math as the original
+    per-player version, just fed from pre-aggregated batch totals."""
+    pg = PRIOR_GOAL_SHARE.get(position, 0.0)
+    pa = PRIOR_ASSIST_SHARE.get(position, 0.0)
+    adj_g = (player_xg + ALPHA * pg) / (team_xg + ALPHA)
+    adj_a = (player_xa + ALPHA * pa) / (team_xg + ALPHA)
+    return adj_g, adj_a
 
 
-def run_predictions(gw: int):
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def run_predictions(gw: int) -> int:
     session = get_session()
-    players = session.execute(text("SELECT player_id, team_id, position FROM players")).fetchall()
-    status_rows = session.execute(text(
-        "SELECT DISTINCT ON (player_id) player_id, status FROM player_snapshots "
-        "ORDER BY player_id, pulled_at DESC")).fetchall()
-    status_map = {r.player_id: r.status for r in status_rows}
+    try:
+        # ---- 7 batch loads ----
+        print(f"[run_predictions] gw{gw}: loading reference data…")
+        players = _load_players(session)
+        statuses = _load_statuses(session, gw)
+        ratings = _load_ratings(session, gw - 1)
+        fixtures_by_team = _load_fixtures(session, gw)
+        minutes_by_player = _load_minutes_histories(
+            session, gw - 1, MINUTES_HISTORY_WINDOW)
+        xgxa_by_player = _load_player_xgxa(session, gw - 1, GOAL_SHARE_WINDOW)
+        team_xg_by_team = _load_team_xg(session, gw - 1, GOAL_SHARE_WINDOW)
+        n_legs = sum(len(v) for v in fixtures_by_team.values())
+        print(f"[run_predictions] gw{gw}: loaded {len(players)} players, "
+              f"{n_legs} fixture-legs, {len(ratings)} team ratings.")
 
-    fixture_rows = session.execute(text("SELECT * FROM fixtures WHERE gw=:gw"), dict(gw=gw)).fetchall()
-    fixtures_by_team = {}
-    for f in fixture_rows:
-        fixtures_by_team.setdefault(f.home_team_id, []).append((f, True))
-        fixtures_by_team.setdefault(f.away_team_id, []).append((f, False))
+        # ---- Python-side computation ----
+        rows_to_write = []
+        injured_rows = 0
+        skipped_bgw = 0
+        normal_rows = 0
 
-    written, skipped_bgw = 0, 0
-    for p in players:
-        legs = fixtures_by_team.get(p.team_id, [])
-        if not legs:
-            skipped_bgw += 1
-            continue  # real BGW -- no prediction row, not a fabricated 0
+        for p in tqdm(players, desc=f"Computing xP (GW{gw})", unit="player"):
+            pid = p["pid"]
+            team_id = p["team_id"]
+            position = p["pos"]
+            status = statuses.get(pid, "a")
 
-        minutes_hist = _minutes_history(session, p.player_id, gw - 1)
-        goal_share, assist_share = _player_xg_xa_share(session, p.player_id, p.team_id, p.position, gw - 1)
-        status = status_map.get(p.player_id, "a")
+            # Injured / suspended / unavailable → explicit zero row
+            if status in ("i", "s", "u", "n"):
+                rows_to_write.append(dict(
+                    pid=pid, gw=gw, mv=MODEL_VERSION,
+                    xm=0.0, p10=0.0, p50=0.0, p90=0.0, sp=0.0, xc=0.0,
+                ))
+                injured_rows += 1
+                continue
 
-        leg_xps, start_probs = [], []
-        for fixture, is_home in legs:
-            opp_id = fixture.away_team_id if is_home else fixture.home_team_id
-            team_r = get_latest_ratings(session, p.team_id, gw - 1)
-            opp_r = get_latest_ratings(session, opp_id, gw - 1)
-            team_attack = team_r["attack_home"] if is_home else team_r["attack_away"]
-            team_defence = team_r["defence_home"] if is_home else team_r["defence_away"]
-            opp_attack = opp_r["attack_away"] if is_home else opp_r["attack_home"]
-            opp_defence = opp_r["defence_away"] if is_home else opp_r["defence_home"]
+            legs = fixtures_by_team.get(team_id, [])
+            if not legs:
+                skipped_bgw += 1
+                continue
 
-            result = player_expected_points(
-                position=p.position, minutes_history=minutes_hist, status=status,
-                team_attack=team_attack, opp_defence=opp_defence,
-                opp_attack=opp_attack, team_defence=team_defence,
-                player_goal_share=goal_share, player_assist_share=assist_share,
-                is_home=is_home,
-            )
-            leg_xps.append(result["xp_mean"])
-            start_probs.append(result["start_prob"])
+            minutes_hist = minutes_by_player.get(pid, [])
+            player_xg, player_xa = xgxa_by_player.get(pid, (0.0, 0.0))
+            team_xg = team_xg_by_team.get(team_id, 0.0)
+            goal_share, assist_share = _share_from_aggregates(
+                player_xg, player_xa, team_xg, position)
 
-        summed_xp = adjust_for_dgw({p.player_id: leg_xps})[p.player_id]
-        avg_start_prob = round(sum(start_probs) / len(start_probs), 3)
-        dist = sample_points_distribution(summed_xp, avg_start_prob)
+            leg_xps, start_probs = [], []
+            for fixture, is_home in legs:
+                opp_id = fixture.away_team_id if is_home else fixture.home_team_id
+                team_r = ratings.get(team_id, NEUTRAL_RATING)
+                opp_r = ratings.get(opp_id, NEUTRAL_RATING)
 
-        session.execute(text("""
-            INSERT INTO predictions (player_id, gw, model_version, xp_mean, xp_p10, xp_p50, xp_p90, start_prob)
-            VALUES (:pid,:gw,:mv,:xm,:p10,:p50,:p90,:sp)
-            ON CONFLICT (player_id, gw, model_version) DO UPDATE SET
-                xp_mean=:xm, xp_p10=:p10, xp_p50=:p50, xp_p90=:p90, start_prob=:sp, created_at=now()
-        """), dict(pid=p.player_id, gw=gw, mv=MODEL_VERSION, xm=summed_xp,
-                    p10=dist["p10"], p50=dist["p50"], p90=dist["p90"], sp=avg_start_prob))
-        written += 1
+                team_attack = (team_r["attack_home"] if is_home
+                               else team_r["attack_away"])
+                team_defence = (team_r["defence_home"] if is_home
+                                else team_r["defence_away"])
+                opp_attack = (opp_r["attack_away"] if is_home
+                              else opp_r["attack_home"])
+                opp_defence = (opp_r["defence_away"] if is_home
+                               else opp_r["defence_home"])
 
-    session.commit()
-    session.close()
-    print(f"Wrote {written} predictions for gw{gw} ({skipped_bgw} skipped -- real BGW, no fixture).")
-    return written
+                result = player_expected_points(
+                    position=position, minutes_history=minutes_hist,
+                    status=status, team_attack=team_attack,
+                    opp_defence=opp_defence, opp_attack=opp_attack,
+                    team_defence=team_defence, player_goal_share=goal_share,
+                    player_assist_share=assist_share, is_home=is_home,
+                )
+                leg_xps.append(result["xp_conditional"])
+                start_probs.append(result["start_prob"])
+
+            summed_conditional = adjust_for_dgw({pid: leg_xps})[pid]
+            avg_start_prob = round(sum(start_probs) / len(start_probs), 3)
+            dist = sample_points_distribution(summed_conditional, avg_start_prob)
+
+            rows_to_write.append(dict(
+                pid=pid, gw=gw, mv=MODEL_VERSION,
+                xm=round(dist["mean"], 2),
+                p10=dist["p10"], p50=dist["p50"], p90=dist["p90"],
+                sp=avg_start_prob, xc=summed_conditional,
+            ))
+            normal_rows += 1
+
+        # ---- One batched upsert ----
+        print(f"[run_predictions] gw{gw}: writing {len(rows_to_write)} rows "
+              f"in one batch…")
+        if rows_to_write:
+            session.execute(text("""
+                INSERT INTO predictions
+                    (player_id, gw, model_version, xp_mean, xp_p10, xp_p50,
+                     xp_p90, start_prob, xp_conditional)
+                VALUES (:pid, :gw, :mv, :xm, :p10, :p50, :p90, :sp, :xc)
+                ON CONFLICT (player_id, gw, model_version) DO UPDATE SET
+                    xp_mean = EXCLUDED.xp_mean,
+                    xp_p10  = EXCLUDED.xp_p10,
+                    xp_p50  = EXCLUDED.xp_p50,
+                    xp_p90  = EXCLUDED.xp_p90,
+                    start_prob = EXCLUDED.start_prob,
+                    xp_conditional = EXCLUDED.xp_conditional,
+                    created_at = now()
+            """), rows_to_write)
+            session.commit()
+
+        print(f"[run_predictions] gw{gw}: done. "
+              f"{len(rows_to_write)} written "
+              f"({injured_rows} injured, {skipped_bgw} BGW, "
+              f"{normal_rows} normal).")
+        return len(rows_to_write)
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":

@@ -1,22 +1,4 @@
-"""Official FPL API ingestion -> immutable snapshots + derived per-GW points.
-
-BUG FIX (v4): bootstrap-static's "total_points" is a SEASON-CUMULATIVE total,
-not a per-gameweek score. v3 stored it directly as if it were per-GW, which
-would have silently corrupted any rolling_form calculation built on top of it.
-Fixed by: (1) storing it under the honestly-named `season_total_points` column
-in the immutable player_snapshots log, and (2) deriving true per-GW points via
-compute_gw_points_from_snapshots(), which diffs consecutive cumulative totals
-and writes the result to player_gw_points -- the ONLY table models should read
-per-GW figures from.
-
-BUG FIX (v5): switched bootstrap + fixtures fetches to a shared requests.Session
-with urllib3.Retry backoff. The per-call `requests.get(..., timeout=15)` was
-hitting the same intermittent `_ssl.c: handshake operation timed out` errors
-that were killing historical_backfill.py on a fresh TLS handshake per request.
-Also stores `first_name` and `second_name` on players so downstream output
-can disambiguate e.g. Callum Wilson vs Harry Wilson.
-"""
-import time
+"""Official FPL API ingestion -> snapshots + per-GW points."""
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -27,51 +9,33 @@ from db.connection import get_session
 from sqlalchemy import text
 
 
-# --------------------------------------------------------------------------- #
-# HTTP session (module-level singleton, reused across all FPL API calls)
-# --------------------------------------------------------------------------- #
 _http_session = None
 
 
-def get_http_session() -> requests.Session:
-    """Shared requests.Session with retries + pooling. Avoids a fresh TLS
-    handshake per call, which was the root cause of intermittent
-    'handshake operation timed out' errors on the FPL API."""
+def get_http_session():
     global _http_session
     if _http_session is not None:
         return _http_session
-
     s = requests.Session()
-    retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        backoff_factor=1.5,                          # 0s, 1.5s, 3s, 6s, 12s
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
+    retry = Retry(total=5, connect=5, read=5, backoff_factor=1.5,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset(["GET"]), raise_on_status=False)
     adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    s.headers.update({
-        "User-Agent": "fpl-agent/1.0 (personal research)",
-        "Accept": "application/json",
-    })
+    s.headers.update({"User-Agent": "fpl-agent/1.0 (personal research)",
+                      "Accept": "application/json"})
     _http_session = s
     return s
 
 
-def _get_json(path: str):
+def _get_json(path):
     s = get_http_session()
     r = s.get(f"{FPL_BASE}{path}", timeout=(10, 30))
     r.raise_for_status()
     return r.json()
 
 
-# --------------------------------------------------------------------------- #
-# Fetchers
-# --------------------------------------------------------------------------- #
 def fetch_bootstrap():
     return _get_json("/bootstrap-static/")
 
@@ -80,9 +44,6 @@ def fetch_fixtures():
     return _get_json("/fixtures/")
 
 
-# --------------------------------------------------------------------------- #
-# Upserts
-# --------------------------------------------------------------------------- #
 def upsert_teams_and_players(data):
     session = get_session()
     for t in tqdm(data["teams"], desc="Upserting teams", unit="team"):
@@ -100,23 +61,15 @@ def upsert_teams_and_players(data):
             "ON CONFLICT (player_id) DO UPDATE SET "
             "web_name=:w, first_name=:fn, second_name=:sn, "
             "team_id=:t, position=:p, now_cost=:c"
-        ), dict(
-            id=p["id"],
-            w=p["web_name"],
-            fn=p.get("first_name", ""),
-            sn=p.get("second_name", ""),
-            t=p["team"],
-            p=pos_map.get(p["element_type"]),
-            c=p["now_cost"] / 10,
-        ))
+        ), dict(id=p["id"], w=p["web_name"],
+                fn=p.get("first_name", ""), sn=p.get("second_name", ""),
+                t=p["team"], p=pos_map.get(p["element_type"]),
+                c=p["now_cost"] / 10))
     session.commit()
     session.close()
 
 
 def snapshot_players(data, gw):
-    """Insert one immutable row per player for this pull. `season_total_points`,
-    `season_goals_scored`, and `season_assists` are all explicitly cumulative --
-    do NOT treat any of them as this gameweek's figure."""
     session = get_session()
     for p in tqdm(data["elements"], desc=f"Snapshotting GW{gw}", unit="player"):
         session.execute(text(
@@ -126,98 +79,122 @@ def snapshot_players(data, gw):
             "expected_goals_conceded, now_cost, status, news) VALUES "
             "(:pid,:t,:gw,:min,:season_pts,:season_g,:season_a,:form,:sel,:ict,"
             ":xg,:xa,:xgc,:cost,:status,:news)"
-        ), dict(
-            pid=p["id"], t=datetime.utcnow(), gw=gw, min=p["minutes"],
-            season_pts=p["total_points"],
-            season_g=p.get("goals_scored", 0),
-            season_a=p.get("assists", 0),
-            form=p["form"], sel=p["selected_by_percent"], ict=p["ict_index"],
-            xg=p.get("expected_goals", 0), xa=p.get("expected_assists", 0),
-            xgc=p.get("expected_goals_conceded", 0), cost=p["now_cost"] / 10,
-            status=p["status"], news=p.get("news", ""),
-        ))
+        ), dict(pid=p["id"], t=datetime.utcnow(), gw=gw, min=p["minutes"],
+                season_pts=p["total_points"],
+                season_g=p.get("goals_scored", 0),
+                season_a=p.get("assists", 0),
+                form=p["form"], sel=p["selected_by_percent"], ict=p["ict_index"],
+                xg=p.get("expected_goals", 0), xa=p.get("expected_assists", 0),
+                xgc=p.get("expected_goals_conceded", 0), cost=p["now_cost"] / 10,
+                status=p["status"], news=p.get("news", "")))
     session.commit()
     session.close()
 
 
 def compute_gw_points_from_snapshots(gw: int):
-    """Derives TRUE per-GW points by diffing this GW's cumulative season total
-    against the most recent prior snapshot's cumulative total, per player.
-    Idempotent thanks to the real UNIQUE(player_id, gw) constraint on
-    player_gw_points -- re-running for the same gw corrects the row rather
-    than duplicating it."""
+    """Derives TRUE per-GW points by diffing this GW's cumulative season
+    totals against the most recent prior snapshot's cumulative totals.
+
+    v5.2 FIXES:
+      1. INNER JOIN (was LEFT JOIN) — if no previous snapshot exists, skip the
+         row entirely instead of writing (current - 0) = cumulative as the
+         per-GW value. That's what corrupted Tzolakis's GW3 row to "270 min".
+      2. ON CONFLICT ... DO UPDATE ... WHERE source != 'backfill' — never
+         overwrite a genuinely per-GW row from historical_backfill. Backfill
+         is authoritative; snapshot_diff is only a fallback for the freshest
+         gw before the API's element-summary endpoint catches up.
+      3. Only diff-write a row when points or minutes actually increased.
+    """
     session = get_session()
     rows = session.execute(text("""
         WITH ranked AS (
-            SELECT player_id, gw, season_total_points, season_goals_scored, season_assists,
-                   minutes, ict_index, expected_goals, expected_assists, now_cost,
-                   ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY pulled_at DESC) AS rn
+            SELECT player_id, gw, season_total_points, season_goals_scored,
+                   season_assists, minutes, ict_index, expected_goals,
+                   expected_assists, now_cost,
+                   ROW_NUMBER() OVER (PARTITION BY player_id
+                                      ORDER BY pulled_at DESC) AS rn
             FROM player_snapshots WHERE gw <= :gw
         ),
         current AS (SELECT * FROM ranked WHERE gw = :gw AND rn = 1),
         previous AS (
-            SELECT DISTINCT ON (player_id) player_id, season_total_points AS prev_total,
-                   season_goals_scored AS prev_goals, season_assists AS prev_assists
+            SELECT DISTINCT ON (player_id) player_id,
+                   season_total_points AS prev_total,
+                   season_goals_scored AS prev_goals,
+                   season_assists AS prev_assists,
+                   minutes AS prev_minutes,
+                   ict_index AS prev_ict,
+                   expected_goals AS prev_xg,
+                   expected_assists AS prev_xa
             FROM ranked WHERE gw < :gw ORDER BY player_id, gw DESC
         )
-        SELECT c.player_id, c.season_total_points - COALESCE(p.prev_total, 0) AS gw_points,
-               c.season_goals_scored - COALESCE(p.prev_goals, 0) AS gw_goals,
-               c.season_assists - COALESCE(p.prev_assists, 0) AS gw_assists,
-               c.minutes, c.ict_index, c.expected_goals, c.expected_assists, c.now_cost
-        FROM current c LEFT JOIN previous p ON p.player_id = c.player_id
+        SELECT c.player_id,
+               c.season_total_points - p.prev_total AS gw_points,
+               c.season_goals_scored - p.prev_goals AS gw_goals,
+               c.season_assists - p.prev_assists AS gw_assists,
+               c.minutes - p.prev_minutes AS gw_minutes,
+               c.ict_index - p.prev_ict AS gw_ict,
+               c.expected_goals - p.prev_xg AS gw_xg,
+               c.expected_assists - p.prev_xa AS gw_xa,
+               c.now_cost
+        FROM current c
+        INNER JOIN previous p ON p.player_id = c.player_id
+        WHERE (c.season_total_points - p.prev_total) > 0
+           OR (c.minutes - p.prev_minutes) > 0
     """), dict(gw=gw)).fetchall()
 
-    for r in tqdm(rows, desc=f"Computing per-GW points (GW{gw})", unit="player"):
+    written = 0
+    for r in tqdm(rows, desc=f"Per-GW points (GW{gw})", unit="player"):
         session.execute(text("""
             INSERT INTO player_gw_points
-                (player_id, gw, gw_points, minutes, goals_scored, assists, ict_index,
-                 expected_goals, expected_assists, now_cost, source)
-            VALUES (:pid, :gw, :pts, :min, :g, :a, :ict, :xg, :xa, :cost, 'snapshot_diff')
+                (player_id, gw, gw_points, minutes, goals_scored, assists,
+                 ict_index, expected_goals, expected_assists, now_cost, source)
+            VALUES (:pid, :gw, :pts, :min, :g, :a, :ict, :xg, :xa, :cost,
+                    'snapshot_diff')
             ON CONFLICT (player_id, gw) DO UPDATE SET
                 gw_points = EXCLUDED.gw_points, minutes = EXCLUDED.minutes,
-                goals_scored = EXCLUDED.goals_scored, assists = EXCLUDED.assists,
-                ict_index = EXCLUDED.ict_index, expected_goals = EXCLUDED.expected_goals,
-                expected_assists = EXCLUDED.expected_assists, now_cost = EXCLUDED.now_cost,
+                goals_scored = EXCLUDED.goals_scored,
+                assists = EXCLUDED.assists,
+                ict_index = EXCLUDED.ict_index,
+                expected_goals = EXCLUDED.expected_goals,
+                expected_assists = EXCLUDED.expected_assists,
+                now_cost = EXCLUDED.now_cost,
                 source = 'snapshot_diff', computed_at = now()
+            WHERE player_gw_points.source != 'backfill'
         """), dict(
-            pid=r.player_id, gw=gw, pts=r.gw_points, min=r.minutes,
-            g=r.gw_goals, a=r.gw_assists, ict=r.ict_index,
-            xg=r.expected_goals, xa=r.expected_assists, cost=r.now_cost,
+            pid=r.player_id, gw=gw,
+            pts=r.gw_points, min=r.gw_minutes,
+            g=r.gw_goals, a=r.gw_assists,
+            ict=r.gw_ict, xg=r.gw_xg, xa=r.gw_xa,
+            cost=r.now_cost,
         ))
+        written += 1
     session.commit()
     session.close()
-    return len(rows)
+    print(f"[fpl_source] compute_gw_points_from_snapshots(gw={gw}): "
+          f"{written} rows written.")
+    return written
 
 
 def upsert_fixtures(fixtures_data):
-    """Writes real fixture rows (gw, teams, kickoff, and final score once played)
-    into the `fixtures` table. Nothing previously called fetch_fixtures() or
-    wrote its result anywhere -- train_team_strength.py and run_predictions.py
-    both read from this table, so without this it silently looks like there
-    are simply no fixtures at all."""
     session = get_session()
     for f in tqdm(fixtures_data, desc="Upserting fixtures", unit="fixture"):
         kickoff = None
         if f.get("kickoff_time"):
             kickoff = f["kickoff_time"].replace("Z", "")
         session.execute(text("""
-            INSERT INTO fixtures (fixture_id, gw, home_team_id, away_team_id, kickoff, home_goals, away_goals)
+            INSERT INTO fixtures (fixture_id, gw, home_team_id, away_team_id,
+                                   kickoff, home_goals, away_goals)
             VALUES (:id, :gw, :h, :a, :ko, :hg, :ag)
             ON CONFLICT (fixture_id) DO UPDATE SET
                 gw = :gw, home_team_id = :h, away_team_id = :a, kickoff = :ko,
                 home_goals = :hg, away_goals = :ag
-        """), dict(
-            id=f["id"], gw=f.get("event"), h=f["team_h"], a=f["team_a"],
-            ko=kickoff, hg=f.get("team_h_score"), ag=f.get("team_a_score"),
-        ))
+        """), dict(id=f["id"], gw=f.get("event"), h=f["team_h"], a=f["team_a"],
+                    ko=kickoff, hg=f.get("team_h_score"), ag=f.get("team_a_score")))
     session.commit()
     session.close()
 
 
 def get_current_gw(data=None):
-    """Determines which gameweek to ingest/snapshot straight from the FPL
-    API's own bootstrap-static `events` list. Picks the event flagged
-    `is_current`, falls back to `is_next`, then to config.CURRENT_GW."""
     try:
         if data is None:
             data = fetch_bootstrap()
@@ -228,12 +205,12 @@ def get_current_gw(data=None):
         for e in events:
             if e.get("is_next"):
                 return e["id"]
-        print("[fpl_source] No gameweek flagged is_current or is_next in the API response.")
+        print("[fpl_source] No is_current or is_next event.")
     except Exception as exc:
-        print(f"[fpl_source] Could not auto-detect current gameweek from the FPL API ({exc}).")
-    from config import CURRENT_GW as _fallback_gw
-    print(f"[fpl_source] Falling back to config.CURRENT_GW={_fallback_gw}.")
-    return _fallback_gw
+        print(f"[fpl_source] Auto-detect failed ({exc}).")
+    from config import CURRENT_GW as _fallback
+    print(f"[fpl_source] Falling back to config.CURRENT_GW={_fallback}.")
+    return _fallback
 
 
 def run_daily_ingest(gw=None):
@@ -247,6 +224,10 @@ def run_daily_ingest(gw=None):
     upsert_teams_and_players(data)
     upsert_fixtures(fetch_fixtures())
     snapshot_players(data, gw)
-    if gw > 1:
-        compute_gw_points_from_snapshots(gw)
+
+    # Compute per-GW points for the most recently COMPLETED gw. When we're
+    # sitting in the middle of GW4, the last completed gw is GW3.
+    completed_gw = gw - 1
+    if completed_gw >= 1:
+        compute_gw_points_from_snapshots(completed_gw)
     return len(data["elements"]), gw
