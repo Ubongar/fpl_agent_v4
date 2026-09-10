@@ -1,7 +1,15 @@
 """Daily entrypoint: ingest -> backfill new features -> re-run calibration ->
-flag drift. Wire this into GitHub Actions (see .github/workflows/daily.yml)."""
+flag drift. Wire this into GitHub Actions (see .github/workflows/daily.yml).
+
+Auto-detects the current gameweek from the FPL API's own bootstrap-static
+is_current/is_next flags (see ingestion.fpl_source.get_current_gw) instead of
+requiring a manually maintained FPL_CURRENT_GW env var. Pass --gw to override
+this and force a specific gameweek instead, e.g. when reprocessing a past one."""
 import sys
-from config import CURRENT_GW
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
 from ingestion.fpl_source import run_daily_ingest
 from db.connection import get_session
 from sqlalchemy import text
@@ -48,9 +56,14 @@ def check_real_calibration():
 
 
 def main():
-    print(f"[retrain_job] Ingesting GW{CURRENT_GW}...")
-    n = run_daily_ingest(CURRENT_GW)
-    print(f"[retrain_job] Snapshotted {n} players.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gw", type=int, default=None,
+                         help="Force a specific gameweek instead of auto-detecting "
+                              "the current one from the FPL API.")
+    args = parser.parse_args()
+
+    n, gw = run_daily_ingest(args.gw)
+    print(f"[retrain_job] Ingested GW{gw}. Snapshotted {n} players.")
 
     ok = check_real_calibration()
     if ok is None:
@@ -58,7 +71,7 @@ def main():
     else:
         print(f"[retrain_job] Calibration OK: {ok}")
         if not ok:
-            print("[retrain_job] WARNING: drift detected, consider retraining expected_minutes model.")
+            print("[retrain_job] WARNING: drift de tected, consider retraining expected_minutes model.")
             sys.exit(1)
 
 if __name__ == "__main__":

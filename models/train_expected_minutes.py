@@ -10,7 +10,10 @@ Saves the fitted model to models/artifacts/expected_minutes_model.joblib
 -- expected_minutes.py automatically loads it if present, and falls back to
 the old heuristic only if no trained model exists yet (e.g. brand new setup).
 """
+import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression

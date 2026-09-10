@@ -11,6 +11,10 @@ prediction row, not a fabricated 0).
 Usage:
     python -m models.run_predictions --gw N
 """
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 from db.connection import get_session
 from sqlalchemy import text

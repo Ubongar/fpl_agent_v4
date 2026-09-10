@@ -5,9 +5,17 @@ CREATE TABLE IF NOT EXISTS teams (
 );
 
 CREATE TABLE IF NOT EXISTS players (
-    player_id INT PRIMARY KEY, web_name TEXT, team_id INT REFERENCES teams(team_id),
-    position TEXT CHECK (position IN ('GK','DEF','MID','FWD')), now_cost NUMERIC
+    player_id INT PRIMARY KEY,
+    web_name TEXT,
+    first_name TEXT,
+    second_name TEXT,
+    team_id INT REFERENCES teams(team_id),
+    position TEXT CHECK (position IN ('GK','DEF','MID','FWD')),
+    now_cost NUMERIC
 );
+-- Safe migrations for existing DBs (add columns if the table already existed)
+ALTER TABLE players ADD COLUMN IF NOT EXISTS first_name TEXT;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS second_name TEXT;
 
 CREATE TABLE IF NOT EXISTS fixtures (
     fixture_id INT PRIMARY KEY, gw INT, home_team_id INT REFERENCES teams(team_id),
@@ -56,7 +64,7 @@ CREATE TABLE IF NOT EXISTS player_gw_points (
     now_cost NUMERIC,
     source TEXT NOT NULL,                    -- 'backfill' | 'snapshot_diff'
     computed_at TIMESTAMP DEFAULT now(),
-    UNIQUE (player_id, gw)                   -- <-- the constraint bug-fix #2 needed
+    UNIQUE (player_id, gw)
 );
 ALTER TABLE player_gw_points ADD COLUMN IF NOT EXISTS goals_scored INT DEFAULT 0;
 ALTER TABLE player_gw_points ADD COLUMN IF NOT EXISTS assists INT DEFAULT 0;
@@ -67,13 +75,14 @@ CREATE TABLE IF NOT EXISTS team_strength (
     PRIMARY KEY (team_id, gw)
 );
 
+-- Predictions table. The UNIQUE index below is what allows run_predictions.py
+-- to upsert idempotently instead of duplicating rows on every rerun. Do NOT
+-- drop it -- you already lost a day to exactly this class of bug in v3.
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id BIGSERIAL PRIMARY KEY, player_id INT, gw INT, model_version TEXT,
     xp_mean NUMERIC, xp_p10 NUMERIC, xp_p50 NUMERIC, xp_p90 NUMERIC, start_prob NUMERIC,
     created_at TIMESTAMP DEFAULT now()
 );
--- Without this, reruns of run_predictions.py would duplicate every row
--- (the exact class of bug already fixed for player_gw_points).
 CREATE UNIQUE INDEX IF NOT EXISTS predictions_player_gw_model_uniq
     ON predictions(player_id, gw, model_version);
 

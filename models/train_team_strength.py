@@ -11,6 +11,10 @@ Usage:
 Writes one row per team into team_strength for the given gw (defaults to the
 latest gw with any finished fixture).
 """
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 from db.connection import get_session
 from sqlalchemy import text

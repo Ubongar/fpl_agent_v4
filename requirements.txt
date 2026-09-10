@@ -11,3 +11,4 @@ pulp
 openai
 python-dotenv
 streamlit-elements==0.1.*
+tqdm

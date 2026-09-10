@@ -1,3 +1,4 @@
+import argparse
 from db.connection import get_session
 from sqlalchemy import text
 
@@ -23,4 +24,7 @@ def check_my_team(gw: int):
     session.close()
 
 if __name__ == "__main__":
-    check_my_team(4)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gw", type=int, required=True, help="The Gameweek to check (e.g. 4)")
+    args = parser.parse_args()
+    check_my_team(args.gw)

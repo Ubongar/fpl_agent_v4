@@ -149,11 +149,12 @@ with tab_transfers:
         else:
             squad_rows = session.execute(text("""
                 SELECT p.player_id, p.web_name AS name, p.position AS pos, p.now_cost AS price,
-                       COALESCE(pr.xp_mean, 0) AS xp
+                       COALESCE(pr.xp_mean, 0) AS xp_mean, COALESCE(pr.start_prob, 1.0) AS start_prob
                 FROM user_squad us JOIN players p ON p.player_id = us.player_id
                 LEFT JOIN predictions pr ON pr.player_id = p.player_id AND pr.gw = us.gw
                 WHERE us.gw = :gw
             """), dict(gw=latest_gw)).fetchall()
+            
             meta = session.execute(text(
                 "SELECT bank, free_transfers FROM team_meta WHERE gw=:gw"),
                 dict(gw=latest_gw)).fetchone()
@@ -162,19 +163,22 @@ with tab_transfers:
                 st.warning("Squad or bank/free-transfers missing for this GW -- re-save above.")
             else:
                 squad = [dict(player_id=r.player_id, name=r.name, pos=r.pos,
-                              price=float(r.price), xp=float(r.xp)) for r in squad_rows]
+                              price=float(r.price), xp_mean=float(r.xp_mean), start_prob=float(r.start_prob)) for r in squad_rows]
+                
                 squad_ids = [p["player_id"] for p in squad]
+                
                 cand_rows = session.execute(text("""
                     SELECT p.player_id, p.web_name AS name, p.position AS pos,
-                           p.now_cost AS price, COALESCE(pr.xp_mean, 0) AS xp
+                           p.now_cost AS price, COALESCE(pr.xp_mean, 0) AS xp_mean, COALESCE(pr.start_prob, 1.0) AS start_prob
                     FROM players p
                     LEFT JOIN predictions pr ON pr.player_id = p.player_id AND pr.gw = :gw
                     WHERE p.player_id != ALL(:ids)
                 """), dict(gw=latest_gw, ids=squad_ids)).fetchall()
-                candidates = [dict(player_id=r.player_id, name=r.name, pos=r.pos,
-                                   price=float(r.price), xp=float(r.xp)) for r in cand_rows]
 
-                if all(p["xp"] == 0 for p in squad):
+                candidates = [dict(player_id=r.player_id, name=r.name, pos=r.pos,
+                                   price=float(r.price), xp_mean=float(r.xp_mean), start_prob=float(r.start_prob)) for r in cand_rows]
+
+                if all(p["xp_mean"] == 0 for p in squad):
                     st.warning(f"No predictions for GW{latest_gw} yet -- run "
                                f"`python -m models.run_predictions --gw {latest_gw}` first.")
 
