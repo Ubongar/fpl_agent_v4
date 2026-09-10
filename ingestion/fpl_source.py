@@ -43,18 +43,21 @@ def upsert_teams_and_players(data):
     session.close()
 
 def snapshot_players(data, gw):
-    """Insert one immutable row per player for this pull. `season_total_points`
-    is explicitly cumulative -- do NOT treat it as this gameweek's score."""
+    """Insert one immutable row per player for this pull. `season_total_points`,
+    `season_goals_scored`, and `season_assists` are all explicitly cumulative --
+    do NOT treat any of them as this gameweek's figure."""
     session = get_session()
     for p in data["elements"]:
         session.execute(text(
             "INSERT INTO player_snapshots (player_id, pulled_at, gw, minutes, "
-            "season_total_points, form, selected_by_percent, ict_index, "
-            "expected_goals, expected_assists, expected_goals_conceded, now_cost, "
-            "status, news) VALUES "
-            "(:pid,:t,:gw,:min,:season_pts,:form,:sel,:ict,:xg,:xa,:xgc,:cost,:status,:news)"
+            "season_total_points, season_goals_scored, season_assists, form, "
+            "selected_by_percent, ict_index, expected_goals, expected_assists, "
+            "expected_goals_conceded, now_cost, status, news) VALUES "
+            "(:pid,:t,:gw,:min,:season_pts,:season_g,:season_a,:form,:sel,:ict,"
+            ":xg,:xa,:xgc,:cost,:status,:news)"
         ), dict(pid=p["id"], t=datetime.utcnow(), gw=gw, min=p["minutes"],
-                season_pts=p["total_points"], form=p["form"], sel=p["selected_by_percent"],
+                season_pts=p["total_points"], season_g=p.get("goals_scored", 0),
+                season_a=p.get("assists", 0), form=p["form"], sel=p["selected_by_percent"],
                 ict=p["ict_index"], xg=p.get("expected_goals", 0), xa=p.get("expected_assists", 0),
                 xgc=p.get("expected_goals_conceded", 0), cost=p["now_cost"]/10,
                 status=p["status"], news=p.get("news", "")))
@@ -71,17 +74,20 @@ def compute_gw_points_from_snapshots(gw: int):
     session = get_session()
     rows = session.execute(text("""
         WITH ranked AS (
-            SELECT player_id, gw, season_total_points, minutes, ict_index,
-                   expected_goals, expected_assists, now_cost,
+            SELECT player_id, gw, season_total_points, season_goals_scored, season_assists,
+                   minutes, ict_index, expected_goals, expected_assists, now_cost,
                    ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY pulled_at DESC) AS rn
             FROM player_snapshots WHERE gw <= :gw
         ),
         current AS (SELECT * FROM ranked WHERE gw = :gw AND rn = 1),
         previous AS (
-            SELECT DISTINCT ON (player_id) player_id, season_total_points AS prev_total
+            SELECT DISTINCT ON (player_id) player_id, season_total_points AS prev_total,
+                   season_goals_scored AS prev_goals, season_assists AS prev_assists
             FROM ranked WHERE gw < :gw ORDER BY player_id, gw DESC
         )
         SELECT c.player_id, c.season_total_points - COALESCE(p.prev_total, 0) AS gw_points,
+               c.season_goals_scored - COALESCE(p.prev_goals, 0) AS gw_goals,
+               c.season_assists - COALESCE(p.prev_assists, 0) AS gw_assists,
                c.minutes, c.ict_index, c.expected_goals, c.expected_assists, c.now_cost
         FROM current c LEFT JOIN previous p ON p.player_id = c.player_id
     """), dict(gw=gw)).fetchall()
@@ -89,15 +95,18 @@ def compute_gw_points_from_snapshots(gw: int):
     for r in rows:
         session.execute(text("""
             INSERT INTO player_gw_points
-                (player_id, gw, gw_points, minutes, ict_index, expected_goals, expected_assists, now_cost, source)
-            VALUES (:pid, :gw, :pts, :min, :ict, :xg, :xa, :cost, 'snapshot_diff')
+                (player_id, gw, gw_points, minutes, goals_scored, assists, ict_index,
+                 expected_goals, expected_assists, now_cost, source)
+            VALUES (:pid, :gw, :pts, :min, :g, :a, :ict, :xg, :xa, :cost, 'snapshot_diff')
             ON CONFLICT (player_id, gw) DO UPDATE SET
                 gw_points = EXCLUDED.gw_points, minutes = EXCLUDED.minutes,
+                goals_scored = EXCLUDED.goals_scored, assists = EXCLUDED.assists,
                 ict_index = EXCLUDED.ict_index, expected_goals = EXCLUDED.expected_goals,
                 expected_assists = EXCLUDED.expected_assists, now_cost = EXCLUDED.now_cost,
                 source = 'snapshot_diff', computed_at = now()
-        """), dict(pid=r.player_id, gw=gw, pts=r.gw_points, min=r.minutes, ict=r.ict_index,
-                    xg=r.expected_goals, xa=r.expected_assists, cost=r.now_cost))
+        """), dict(pid=r.player_id, gw=gw, pts=r.gw_points, min=r.minutes, g=r.gw_goals,
+                    a=r.gw_assists, ict=r.ict_index, xg=r.expected_goals, xa=r.expected_assists,
+                    cost=r.now_cost))
     session.commit()
     session.close()
     return len(rows)

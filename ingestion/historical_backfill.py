@@ -25,15 +25,18 @@ def backfill_all(player_ids):
         for gw_row in fetch_player_history(pid):
             session.execute(text("""
                 INSERT INTO player_gw_points
-                    (player_id, gw, gw_points, minutes, ict_index, expected_goals, expected_assists, now_cost, source)
-                VALUES (:pid, :gw, :pts, :min, :ict, :xg, :xa, :cost, 'backfill')
+                    (player_id, gw, gw_points, minutes, goals_scored, assists, ict_index,
+                     expected_goals, expected_assists, now_cost, source)
+                VALUES (:pid, :gw, :pts, :min, :g, :a, :ict, :xg, :xa, :cost, 'backfill')
                 ON CONFLICT (player_id, gw) DO UPDATE SET
                     gw_points = EXCLUDED.gw_points, minutes = EXCLUDED.minutes,
+                    goals_scored = EXCLUDED.goals_scored, assists = EXCLUDED.assists,
                     ict_index = EXCLUDED.ict_index, expected_goals = EXCLUDED.expected_goals,
                     expected_assists = EXCLUDED.expected_assists, now_cost = EXCLUDED.now_cost,
                     source = 'backfill', computed_at = now()
             """), dict(pid=pid, gw=gw_row["round"], pts=gw_row["total_points"],
-                        min=gw_row["minutes"], ict=gw_row.get("ict_index"),
+                        min=gw_row["minutes"], g=gw_row.get("goals_scored", 0),
+                        a=gw_row.get("assists", 0), ict=gw_row.get("ict_index"),
                         xg=gw_row.get("expected_goals", 0), xa=gw_row.get("expected_assists", 0),
                         cost=gw_row["value"] / 10))
             inserted += 1

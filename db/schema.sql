@@ -26,10 +26,14 @@ CREATE TABLE IF NOT EXISTS player_snapshots (
     gw INT,                                  -- the "current event" gw at time of pull
     minutes INT,                             -- cumulative season minutes at time of pull
     season_total_points INT,                 -- CUMULATIVE season total (bootstrap-static "total_points")
+    season_goals_scored INT,                 -- CUMULATIVE season goals (bootstrap-static "goals_scored")
+    season_assists INT,                      -- CUMULATIVE season assists (bootstrap-static "assists")
     form NUMERIC, selected_by_percent NUMERIC, ict_index NUMERIC,
     expected_goals NUMERIC, expected_assists NUMERIC, expected_goals_conceded NUMERIC,
     now_cost NUMERIC, status TEXT, news TEXT
 );
+ALTER TABLE player_snapshots ADD COLUMN IF NOT EXISTS season_goals_scored INT;
+ALTER TABLE player_snapshots ADD COLUMN IF NOT EXISTS season_assists INT;
 
 -- Single source of truth for TRUE per-gameweek player performance.
 -- Populated two ways, both idempotent thanks to the UNIQUE constraint:
@@ -44,6 +48,8 @@ CREATE TABLE IF NOT EXISTS player_gw_points (
     gw INT NOT NULL,
     gw_points INT NOT NULL,
     minutes INT,
+    goals_scored INT DEFAULT 0,
+    assists INT DEFAULT 0,
     ict_index NUMERIC,
     expected_goals NUMERIC,
     expected_assists NUMERIC,
@@ -52,6 +58,8 @@ CREATE TABLE IF NOT EXISTS player_gw_points (
     computed_at TIMESTAMP DEFAULT now(),
     UNIQUE (player_id, gw)                   -- <-- the constraint bug-fix #2 needed
 );
+ALTER TABLE player_gw_points ADD COLUMN IF NOT EXISTS goals_scored INT DEFAULT 0;
+ALTER TABLE player_gw_points ADD COLUMN IF NOT EXISTS assists INT DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS team_strength (
     team_id INT REFERENCES teams(team_id), gw INT,
@@ -63,6 +71,28 @@ CREATE TABLE IF NOT EXISTS predictions (
     prediction_id BIGSERIAL PRIMARY KEY, player_id INT, gw INT, model_version TEXT,
     xp_mean NUMERIC, xp_p10 NUMERIC, xp_p50 NUMERIC, xp_p90 NUMERIC, start_prob NUMERIC,
     created_at TIMESTAMP DEFAULT now()
+);
+-- Without this, reruns of run_predictions.py would duplicate every row
+-- (the exact class of bug already fixed for player_gw_points).
+CREATE UNIQUE INDEX IF NOT EXISTS predictions_player_gw_model_uniq
+    ON predictions(player_id, gw, model_version);
+
+-- Nothing previously tracked "your actual 15" anywhere -- required by
+-- Transfers/Captaincy/Chips, which all act on the manager's own squad,
+-- not the full player pool.
+CREATE TABLE IF NOT EXISTS user_squad (
+    player_id INT REFERENCES players(player_id),
+    gw INT NOT NULL,
+    bought_price NUMERIC,
+    is_starting BOOLEAN DEFAULT true,
+    is_captain BOOLEAN DEFAULT false,
+    PRIMARY KEY (player_id, gw)
+);
+
+CREATE TABLE IF NOT EXISTS team_meta (
+    gw INT PRIMARY KEY,
+    bank NUMERIC NOT NULL DEFAULT 0,
+    free_transfers INT NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS recommendations (
